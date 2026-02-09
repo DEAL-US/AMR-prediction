@@ -21,7 +21,7 @@ Two model architectures are provided:
 
 The experiments use three types of datasets. All are available on BioStudies:
 
-> **[Dataset link](TODO)** — *add BioStudies accession URL here*
+> **[Dataset link](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
 
 ### 1. NDARO (CSV)
 
@@ -130,7 +130,7 @@ All settings are defined in the `config` dictionary inside `main.py`. Open the f
 For each sparse dataset path (e.g. `.../bakta50.npz`), the loader expects `_assemblies.pkl` and `_columns.pkl` companion files with the same base name in the same directory.
 
 Datasets link:
-> **[Dataset link](TODO)** — *add BioStudies accession URL here*
+> **[Dataset link](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
 
 ### Model hyperparameters
 
