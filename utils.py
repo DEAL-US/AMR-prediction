@@ -1,9 +1,10 @@
 """
-Utility helpers: metric aggregation, results I/O, logging setup, and device
-selection.
+Utility helpers: metric aggregation, results I/O, model saving, logging setup,
+and device selection.
 """
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Dict, List
 
@@ -87,6 +88,49 @@ def write_results(
     logger = logging.getLogger("baseline")
     logger.info("Wrote results to %s (rows=%d)", csv_path, len(combined))
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Detailed (per-run) results persistence
+# ---------------------------------------------------------------------------
+def write_detailed_results(
+    csv_path: Path,
+    new_rows: List[Dict[str, object]],
+) -> None:
+    """Append per-run metric rows to the detailed results CSV."""
+    if not new_rows:
+        return
+    new_df = pd.DataFrame(new_rows)
+    if csv_path.exists():
+        new_df.to_csv(csv_path, mode="a", header=False, index=False)
+    else:
+        new_df.to_csv(csv_path, index=False)
+    logger = logging.getLogger("baseline")
+    logger.info("Appended %d rows to %s", len(new_rows), csv_path)
+
+
+# ---------------------------------------------------------------------------
+# Model saving
+# ---------------------------------------------------------------------------
+def _sanitize_name(name: str) -> str:
+    """Make a string safe for use as a file/directory name."""
+    return re.sub(r'[^\w\-]', '_', name).strip('_')
+
+
+def save_model_state(
+    output_dir: Path,
+    dataset_name: str,
+    antibiotic_name: str,
+    state_dict: dict,
+) -> Path:
+    """Save a model's ``state_dict`` to ``<output_dir>/models/<dataset>/<antibiotic>.pt``."""
+    model_dir = output_dir / "models" / _sanitize_name(dataset_name)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    path = model_dir / f"{_sanitize_name(antibiotic_name)}.pt"
+    torch.save(state_dict, path)
+    logger = logging.getLogger("baseline")
+    logger.info("Saved model to %s", path)
+    return path
 
 
 # ---------------------------------------------------------------------------

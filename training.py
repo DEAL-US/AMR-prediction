@@ -252,8 +252,8 @@ def train_and_eval_once(
     mcfg: ModelConfig,
     rseed: int,
     device: torch.device,
-) -> Dict[str, float]:
-    """Train a BaselineMLP for one seed and return test-set metrics."""
+) -> Tuple[Dict[str, float], dict]:
+    """Train a BaselineMLP for one seed and return (test-set metrics, state_dict)."""
     test_size = mcfg.val_fraction  # reuse for outer split convention
     stratify = y if len(np.unique(y)) > 1 else None
     try:
@@ -320,7 +320,10 @@ def train_and_eval_once(
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return evaluate(model, test_loader, device)
+    metrics = evaluate(model, test_loader, device)
+    # Return metrics + a CPU copy of the final state_dict
+    state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    return metrics, state
 
 
 def train_and_eval_once_two_tower(
@@ -330,8 +333,8 @@ def train_and_eval_once_two_tower(
     mcfg: ModelConfig,
     rseed: int,
     device: torch.device,
-) -> Dict[str, float]:
-    """Train a TwoTowerMLP for one seed and return test-set metrics."""
+) -> Tuple[Dict[str, float], dict]:
+    """Train a TwoTowerMLP for one seed and return (test-set metrics, state_dict)."""
     stratify = y if len(np.unique(y)) > 1 else None
     try:
         Xg_train, Xg_test, Xu_train, Xu_test, y_train, y_test = train_test_split(
@@ -411,4 +414,6 @@ def train_and_eval_once_two_tower(
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return evaluate_two_tower(model, test_loader, device)
+    metrics = evaluate_two_tower(model, test_loader, device)
+    state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    return metrics, state

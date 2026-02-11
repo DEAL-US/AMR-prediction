@@ -21,7 +21,7 @@ Two model architectures are provided:
 
 The experiments use three types of datasets. All are available on BioStudies:
 
-> **[Dataset link](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
+> **[Dataset in BioStudies](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
 
 ### 1. NDARO (CSV)
 
@@ -130,7 +130,7 @@ All settings are defined in the `config` dictionary inside `main.py`. Open the f
 For each sparse dataset path (e.g. `.../bakta50.npz`), the loader expects `_assemblies.pkl` and `_columns.pkl` companion files with the same base name in the same directory.
 
 Datasets link:
-> **[Dataset link](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
+> **[Dataset in BioStudies](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
 
 ### Model hyperparameters
 
@@ -158,8 +158,10 @@ Datasets link:
 | Key | Default | Description |
 |---|---|---|
 | `runs` | `30` | Number of independent random seeds per antibiotic |
-| `output_dir` | `"results"` | Directory where `results.csv` is written |
+| `output_dir` | `"results"` | Directory where `results.csv` will be written |
 | `limit_antibiotics` | `None` | List of antibiotic names to evaluate, or `None` for all |
+| `save_models` | `False` | Save the best model's `state_dict` (`.pt`) per (dataset, antibiotic) |
+| `save_detailed_results` | `False` | Save per-run metrics to `results_detailed.csv` |
 
 ## Running
 
@@ -197,6 +199,39 @@ Results are written to `<output_dir>/results.csv` (default: `results/results.csv
 ### Resume support
 
 The script checks the existing `results.csv` before starting each antibiotic. If a (dataset, antibiotic) pair is already present, it is skipped. This means user can safely **interrupt and restart** the script.
+
+### Detailed per-run results (`save_detailed_results`)
+
+When enabled, the script writes `<output_dir>/results_detailed.csv` alongside the aggregated `results.csv`. Each row records a **single run** instead of the averaged metrics:
+
+| Column | Description |
+|---|---|
+| `dataset` | Dataset name |
+| `antibiotic` | Antibiotic name |
+| `run` | Run index (0-based) |
+| `seed` | Random seed used for this run |
+| `n_samples`, `n_pos`, `n_neg` | Sample counts |
+| `f1`, `accuracy`, `precision`, `recall` | Metrics for this individual run (4 decimal places) |
+| `tp`, `tn`, `fp`, `fn` | Confusion matrix counts for this run |
+
+### Saved models (`save_models`)
+
+When enabled, the script saves the PyTorch `state_dict` of the **best model** (highest test F1 across all runs) for each (dataset, antibiotic) pair:
+
+```
+<output_dir>/models/<dataset_name>/<antibiotic_name>.pt
+```
+
+To reload a saved model:
+
+```python
+import torch
+from models import BaselineMLP  # or TwoTowerMLP for combined datasets
+
+model = BaselineMLP(input_dim=..., hidden_dims=[512, 256], dropout=0.2)
+model.load_state_dict(torch.load("results/models/NDARO/ciprofloxacin.pt"))
+model.eval()
+```
 
 ## Training details
 

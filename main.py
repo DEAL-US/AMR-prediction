@@ -38,6 +38,8 @@ from utils import (
     load_existing_results,
     result_row_exists,
     write_results,
+    write_detailed_results,
+    save_model_state,
     get_device,
 )
 
@@ -55,6 +57,9 @@ def run_for_dataset(
     sparse_datasets: Dict[str, Path],
     limit_antibiotics: Optional[List[str]] = None,
     results_csv: Optional[Path] = None,
+    save_models: bool = False,
+    save_detailed_results: bool = False,
+    output_dir: Optional[Path] = None,
 ) -> List[Dict[str, object]]:
     """
     Run all antibiotic experiments for a single dataset configuration.
@@ -133,16 +138,57 @@ def run_for_dataset(
 
         # Multiple random runs -------------------------------------------
         metrics_runs: List[Dict[str, float]] = []
+        best_f1 = float("-inf")
+        best_state_dict = None
+        best_seed = None
+        detailed_rows: List[Dict[str, object]] = []
+
         for run_idx in tqdm(range(rcfg.runs_per_antibiotic),
                             desc=f"runs {antibiotic_name}", leave=False):
             seed = rcfg.base_seed + run_idx
             torch.manual_seed(seed)
             np.random.seed(seed)
             if dcfg.is_combined:
-                metrics = train_and_eval_once_two_tower(Xg, Xu, y, mcfg, seed, device)
+                metrics, state = train_and_eval_once_two_tower(Xg, Xu, y, mcfg, seed, device)
             else:
-                metrics = train_and_eval_once(X, y, mcfg, seed, device)
+                metrics, state = train_and_eval_once(X, y, mcfg, seed, device)
             metrics_runs.append(metrics)
+
+            # Track best model (by F1)
+            run_f1 = metrics.get("f1", float("nan"))
+            if not math.isnan(run_f1) and run_f1 > best_f1:
+                best_f1 = run_f1
+                best_state_dict = state
+                best_seed = seed
+
+            # Collect per-run row for detailed CSV
+            if save_detailed_results:
+                detailed_rows.append({
+                    "dataset": dcfg.name,
+                    "antibiotic": antibiotic_name,
+                    "run": run_idx,
+                    "seed": seed,
+                    "n_samples": n_total,
+                    "n_pos": n_pos,
+                    "n_neg": n_neg,
+                    "f1": None if math.isnan(metrics.get("f1", math.nan)) else round(metrics["f1"], 4),
+                    "accuracy": None if math.isnan(metrics.get("accuracy", math.nan)) else round(metrics["accuracy"], 4),
+                    "precision": None if math.isnan(metrics.get("precision", math.nan)) else round(metrics["precision"], 4),
+                    "recall": None if math.isnan(metrics.get("recall", math.nan)) else round(metrics["recall"], 4),
+                    "tp": metrics.get("tp", 0),
+                    "tn": metrics.get("tn", 0),
+                    "fp": metrics.get("fp", 0),
+                    "fn": metrics.get("fn", 0),
+                })
+
+        # Save best model weights
+        if save_models and best_state_dict is not None and output_dir is not None:
+            save_model_state(output_dir, dcfg.name, antibiotic_name, best_state_dict)
+
+        # Write detailed per-run results
+        if save_detailed_results and detailed_rows and output_dir is not None:
+            detailed_csv = output_dir / "results_detailed.csv"
+            write_detailed_results(detailed_csv, detailed_rows)
 
         agg = aggregate_metrics(metrics_runs)
         row = {
@@ -217,6 +263,10 @@ def main():
         # -- Experiment protocol ------------------------------------------
         "runs": 30,                     # independent seeds per antibiotic
 
+        # -- Optional outputs ---------------------------------------------
+        "save_models": True,           # save best model state_dict per (dataset, antibiotic)
+        "save_detailed_results": True, # save per-run metrics to results_detailed.csv
+
         # -- Antibiotic filter (None = evaluate all) ----------------------
         "limit_antibiotics": None,
         # Example: uncomment the list below to restrict to specific antibiotics
@@ -282,6 +332,9 @@ def main():
             sparse_datasets=sparse_datasets,
             limit_antibiotics=config["limit_antibiotics"],
             results_csv=results_csv,
+            save_models=config["save_models"],
+            save_detailed_results=config["save_detailed_results"],
+            output_dir=output_dir,
         )
         # Refresh from disk after each dataset (picks up newly written rows)
         existing_df = load_existing_results(results_csv)
