@@ -129,8 +129,11 @@ def load_ndaro_csv(csv_path: Path):
     labels = np.full((len(df), len(a_cols)), -1, dtype=np.int8)
     for j, c in enumerate(a_cols):
         col = df[c].astype("string")
-        labels[col == "S", j] = 0
-        labels[col == "R", j] = 1
+        # .fillna(False).to_numpy(bool) yields a plain numpy mask; comparing a
+        # nullable string column directly leaves <NA> entries that numpy cannot
+        # use for indexing.
+        labels[(col == "S").fillna(False).to_numpy(dtype=bool), j] = 0
+        labels[(col == "R").fillna(False).to_numpy(dtype=bool), j] = 1
     return feats, g_cols, assemblies, organism, labels, a_cols
 
 
