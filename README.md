@@ -76,9 +76,21 @@ For each BAKTA variant, the pipeline also creates a **combined** dataset by inne
 ├── data.py           # Dataset loading (CSV, sparse NPZ/PKL, combined)
 ├── training.py       # Training loops, evaluation, data-loader construction
 ├── utils.py          # Metric aggregation, results I/O, logging, device selection
+├── scripts/          # Standalone analyses (AMRFinderPlus benchmark, LOSO)
 ├── requirements.txt  # Python dependencies
 └── README.md
 ```
+
+## Additional analyses
+
+The `scripts/` folder contains two standalone analyses, with their own
+[README](scripts/README.md):
+
+- **`amrfinderplus_baseline.py`** — rule-based AMRFinderPlus benchmark.
+- **`loso_evaluation.py`** — leave-one-species-out cross-species generalisation.
+
+Both are configured via a `CONFIG` block at the top of each file (as in
+`main.py`), are independent of the main pipeline, and reuse the same datasets.
 
 ## Prerequisites
 
