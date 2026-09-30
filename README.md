@@ -1,255 +1,133 @@
-# Antibiotic Resistance Prediction – Combining curated AMR genes and genome-wide annotations
+# Neural networks combining curated resistance genes and genome-wide annotations for antimicrobial resistance prediction
 
-Binary classification of antibiotic **susceptibility (S) vs. resistance (R)** using neural networks trained on genomic feature matrices.
+For every antibiotic, a binary classifier predicts **resistance (R) vs susceptibility (S)** of bacterial isolates from genomic features. Nine feature representations are compared with the same learning algorithm, splits and seeds:
 
-## Overview
+| Representation | Features |
+|---|---|
+| **NDARO** | presence/absence of the 935 curated AMR genes detected by AMRFinderPlus (NCBI NDARO) |
+| **BAKTA50 AMR** / **BAKTA90 AMR** | AMR-related genes annotated by BAKTA, clustered at UniRef50 (1,047 clusters) / UniRef90 (1,901) |
+| **BAKTA50** / **BAKTA90** | all BAKTA-annotated genes, clustered at UniRef50 (20,407 clusters) / UniRef90 (25,647), keeping clusters present in at least 500 isolates |
+| **NDARO + BAKTA…** | each of the four BAKTA representations combined with NDARO (two-tower model) |
 
-This repository contains the code for reproducing experiments for AMR prediction. Given a set of bacterial genome assemblies from NCBI NDARO database annotated with antibiotic susceptibility phenotypes and their annotations by BAKTA, the pipeline:
+All models are compared with a **rule-based AMRFinderPlus baseline**, which needs no training: an isolate is predicted resistant when it carries at least one AMRFinderPlus-detected gene (the same 935 NDARO genes) that targets the antibiotic's drug class according to the CARD ARO index (`scripts/amrfinderplus_baseline.py`).
 
-1. Loads one or more genomic feature datasets (gene presence/absence matrices).
-2. For each antibiotic, trains a binary classifier over multiple random seeds.
-3. Reports aggregated metrics (F1, accuracy, precision, recall, confusion matrix counts) in a single results CSV.
+Two architectures are used:
 
-Two model architectures are provided:
-
-| Architecture | Use case | Description |
+| Architecture | Used for | Description |
 |---|---|---|
-| **BaselineMLP** | Single feature source | Standard feed-forward network: `[Linear → ReLU → Dropout] × N → Linear(1)` |
-| **TwoTowerMLP** | Combined feature sources | Two parallel encoder branches (one per feature source) whose embeddings are concatenated and passed through a linear fusion head |
+| **BaselineMLP** | one feature source | `[Linear → ReLU → Dropout] × 2 → Linear(1)`, hidden sizes 512 and 256 |
+| **TwoTowerMLP** | two feature sources | one 512 → 256 tower per source; the two embeddings are concatenated and passed to a linear output layer |
 
-## Datasets
+## Data
 
-The experiments use three types of datasets. All are available on BioStudies:
+All inputs are available on BioStudies: **[S-BSST2698](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**. Download them into `data/`:
 
-> **[Dataset in BioStudies](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
-
-### 1. NDARO (CSV)
-
-Isolate-level information from NDARO Isolates Browser, comprising approximately 20,000 isolates from diverse bacterial species, with resistance annotations for 935 AMR-associated genes and phenotypic susceptibility information spanning 112 antibiotics. A single CSV file (`processed.csv`) with columns:
-
-| Column pattern | Description |
+| File | Content |
 |---|---|
-| `assembly` | Unique genome assembly identifier |
-| `organism` | Organism name |
-| `g_*` | Gene presence/absence features (binary 0/1) |
-| `a_*` | Antibiotic phenotype labels (`S` = susceptible, `R` = resistant, or missing) |
+| `ndaro_baseline.csv` | NDARO isolates: `assembly`, `organism`, 935 `g_*` gene features (0/1) and 112 `a_*` phenotypes (`S`, `R` or empty). An assembly can appear in several rows (one per NCBI release); the first row is used. |
+| `bakta50.npz`, `bakta50_amr.npz`, `bakta90.npz`, `bakta90_amr.npz` | sparse matrices (SciPy) with one row per assembly and one column per UniRef cluster, plus the `a_*` phenotype columns (1 = R, 0 = S, NaN = not tested) |
+| `<name>_columns.pkl`, `<name>_assemblies.pkl` | column names and assembly identifiers of each matrix |
+| `S1_antibiotic_summary.csv`, `S2_antibiotic_species_breakdown.csv` | number of labelled, resistant and susceptible isolates per antibiotic, and per species |
 
-### 2. BAKTA Datasets (NPZ + PKL)
+The AMRFinderPlus benchmark also needs the CARD ARO index (`aro_index.tsv`, from [card.mcmaster.ca/download](https://card.mcmaster.ca/download)) in `data/`.
 
-In addition to the isolate-level metadata, we processed the genome assembly of each sample thorugh BAKTA, an automated bacterial genome annotation tool that produces standardized functional descriptions of genomic elements. In order to save space with a more compressed format, each BAKTA dataset consists of a **triplet** of files sharing the same base name:
-
-| File | Format | Content |
-|---|---|---|
-| `<base>.npz` | SciPy sparse matrix | Rows = assemblies, columns = features + antibiotic labels |
-| `<base>_assemblies.pkl` | Python pickle (list) | Assembly identifiers (one per row) |
-| `<base>_columns.pkl` | Python pickle (list) | Column names; those starting with `a_` are antibiotic labels, the rest are features |
-
-Four variants are provided:
-
-| Name | Description |
-|---|---|
-| **BAKTA50** | UniRef50 cluster presence, filtered to clusters present in ≥500 assemblies |
-| **BAKTA50 AMR** | UniRef50 clusters restricted to AMR-associated genes (via AMRFinder) |
-| **BAKTA90** | UniRef90 cluster presence, filtered ≥500 |
-| **BAKTA90 AMR** | UniRef90 clusters restricted to AMR-associated genes |
-
-Feature columns in the sparse datasets are prefixed with `U_` (UniRef).
-
-### 3. Combined Datasets (built on-the-fly)
-
-For each BAKTA variant, the pipeline also creates a **combined** dataset by inner-joining NDARO and the sparse dataset on the `assembly` column. These combined datasets have both `g_*` (gene) and `U_*` (UniRef) feature blocks and are evaluated using the `TwoTowerMLP` architecture.
-
-### Column naming conventions
-
-| Prefix | Meaning |
-|---|---|
-| `g_` | Gene-level features (from NDARO) |
-| `U_` | UniRef cluster features (from BAKTA) |
-| `a_` | Antibiotic phenotype labels |
-
-## Project Structure
-
-```
-├── main.py           # Entry point: configuration and experiment orchestration
-├── config.py         # Dataclass definitions (ModelConfig, RunConfig, DatasetConfig)
-├── models.py         # Neural network architectures (BaselineMLP, TwoTowerMLP)
-├── data.py           # Dataset loading (CSV, sparse NPZ/PKL, combined)
-├── training.py       # Training loops, evaluation, data-loader construction
-├── utils.py          # Metric aggregation, results I/O, logging, device selection
-├── scripts/          # Standalone analyses (AMRFinderPlus benchmark, LOSO)
-├── requirements.txt  # Python dependencies
-└── README.md
-```
-
-## Additional analyses
-
-The `scripts/` folder contains two standalone analyses, with their own
-[README](scripts/README.md):
-
-- **`amrfinderplus_baseline.py`** — rule-based AMRFinderPlus benchmark.
-- **`loso_evaluation.py`** — leave-one-species-out cross-species generalisation.
-
-Both are configured via a `CONFIG` block at the top of each file (as in
-`main.py`), are independent of the main pipeline, and reuse the same datasets.
-
-## Prerequisites
-
-- **Python** ≥ 3.8
-- **PyTorch** (CPU or CUDA)
-- The remaining dependencies are listed in `requirements.txt`
-
-> **Note:** CUDA is strongly recommended. Training on CPU is functional but significantly slower.
+**Antibiotics.** An antibiotic is analysed when it has at least 50 labelled isolates and at least 5 isolates in the minority class. This gives the 61 antibiotics of the paper (amoxicillin, florfenicol, temocillin and ticarcillin-clavulanic acid have 50 or more isolates but fewer than 5 in the minority class).
 
 ## Installation
 
 ```bash
-# 1. Clone the repository
-git clone <repo-url>
-cd <repo-name>
+git clone https://github.com/DEAL-US/AMR-prediction.git
+cd AMR-prediction
 
-# 2. (Recommended) Create a virtual environment
 python -m venv .venv
-source .venv/bin/activate   # Linux/macOS
-# .venv\Scripts\activate    # Windows
+source .venv/bin/activate          # Linux/macOS
+# .venv\Scripts\activate           # Windows
 
-# 3.1 Install PyTorch for your system (example for CUDA 12.6)
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-# 3.2 Or install PyTorch for CPU usage
-pip3 install torch torchvision
-
-# All PyTorch installation configurations can be found at https://pytorch.org/get-started/locally/
-
-# 4. Install remaining dependencies
+# PyTorch for your system (see https://pytorch.org/get-started/locally/), e.g. CUDA 12.6:
+pip install torch --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
 
-## Configuration
+A GPU is strongly recommended; training on CPU works but is much slower.
 
-All settings are defined in the `config` dictionary inside `main.py`. Open the file and edit the values to match your setup:
+## Usage
 
-### Dataset paths
+All scripts are run from the repository root. Settings live in a `CONFIG` block at the top of each script; the main ones can also be overridden from the command line (`--help`).
 
-```python
-"ndaro_path": "/path/to/data/ndaro/processed.csv",
-"sparse_datasets": {
-    "BAKTA50":     "/path/to/data/bakta/bakta50.npz",
-    "BAKTA50 AMR": "/path/to/data/bakta/bakta50_amr.npz",
-    "BAKTA90":     "/path/to/data/bakta/bakta90.npz",
-    "BAKTA90 AMR": "/path/to/data/bakta/bakta90_amr.npz",
-},
-```
-
-For each sparse dataset path (e.g. `.../bakta50.npz`), the loader expects `_assemblies.pkl` and `_columns.pkl` companion files with the same base name in the same directory.
-
-Datasets link:
-> **[Dataset in BioStudies](https://www.ebi.ac.uk/biostudies/studies/S-BSST2698)**
-
-### Model hyperparameters
-
-| Key | Default | Description |
+| Script | Results for | Output (default) |
 |---|---|---|
-| `hidden_dims` | `[512, 256]` | Hidden layer sizes for each MLP |
-| `dropout` | `0.2` | Dropout rate between hidden layers |
-| `lr` | `1e-3` | Learning rate (AdamW) |
-| `weight_decay` | `0.0` | L2 regularization |
-| `batch_size` | `512` | Mini-batch size |
-| `epochs` | `200` | Maximum training epochs |
-
-### Early stopping
-
-| Key | Default | Description |
-|---|---|---|
-| `val_fraction` | `0.1` | Fraction of training data held out for validation |
-| `use_early_stopping` | `True` | Enable early stopping based on validation metric |
-| `es_metric` | `"f1"` | Metric to monitor (`f1`, `accuracy`, `precision`, `recall`) |
-| `es_patience` | `10` | Epochs without improvement before stopping |
-| `es_min_delta` | `0.0` | Minimum improvement to reset patience counter |
-
-### Experiment protocol
-
-| Key | Default | Description |
-|---|---|---|
-| `runs` | `30` | Number of independent random seeds per antibiotic |
-| `output_dir` | `"results"` | Directory where `results.csv` will be written |
-| `limit_antibiotics` | `None` | List of antibiotic names to evaluate, or `None` for all |
-| `save_models` | `False` | Save the best model's `state_dict` (`.pt`) per (dataset, antibiotic) |
-| `save_detailed_results` | `False` | Save per-run metrics to `results_detailed.csv` |
-
-## Running
+| `main.py` | Table 2, Figure 4, Table 3, Supplementary Table S2 | `results/random_split/` |
+| `main.py --organism "<species>"` | Table 5 (models trained within one species) | set `--output-dir` |
+| `scripts/amrfinderplus_baseline.py` | AMRFinderPlus baseline (Tables 2, 5 and 6) | `results/amrfinderplus/` |
+| `scripts/loso_evaluation.py` | Table 6, Figure 5 (leave-one-species-out) | `results/loso/` |
+| `scripts/integrated_gradients.py` | Table 4 (non-AMR clusters, Integrated Gradients) | `results/integrated_gradients/` |
 
 ```bash
+# All representations, 30 seeds, every eligible antibiotic
 python main.py
+
+# Within-species training, e.g. Campylobacter jejuni
+python main.py --organism "Campylobacter jejuni" --output-dir results/campylobacter_jejuni
+
+# Rule-based AMRFinderPlus baseline (all isolates and each species)
+python scripts/amrfinderplus_baseline.py
+
+# Leave-one-species-out (uses the baseline output for the AMRFinderPlus column)
+python scripts/loso_evaluation.py
+
+# Integrated Gradients (uses main.py's results.csv to select the antibiotics)
+python scripts/integrated_gradients.py
 ```
 
-The script will iterate over all configured datasets (NDARO alone, each BAKTA variant alone, and each BAKTA + NDARO combined) and, for each antibiotic column, run the specified number of training seeds.
+Progress is shown with `tqdm` bars at the dataset, antibiotic, seed and epoch levels (the epoch bar shows the training loss and validation F1; the seed bar, the last test F1 and geometric-mean accuracy).
 
-Training progress is displayed via `tqdm` progress bars at the dataset, antibiotic, run, and epoch levels.
+Organism names are those of the `organism` column: `Salmonella enterica`, `E.coli and Shigella`, `Campylobacter jejuni`, `Acinetobacter baumannii`, …
 
-## Output
+## Protocol
 
-Results are written to `<output_dir>/results.csv` (default: `results/results.csv`). Each row corresponds to one (dataset, antibiotic) pair with metrics averaged over all runs:
+- **Splits**: stratified 72% training / 8% validation / 20% test (`StratifiedShuffleSplit`), 30 seeds (0–29) per antibiotic and representation. The seed fixes the split, the initialisation, the batch order and dropout, so results are reproducible up to GPU floating-point non-determinism.
+- **Within-species training** (`--organism`) applies the same protocol and antibiotic eligibility to the isolates of one species.
+- **Training**: AdamW (learning rate 1e-3, no weight decay), batch size 512, binary cross-entropy with per-sample weights inversely proportional to class frequency in the training part, dropout 0.2. At most 200 epochs, with early stopping on validation F1 (patience 10); the best validation checkpoint is evaluated on the test set.
+- **Metrics**: F1, precision, recall and accuracy at a 0.5 threshold; specificity; geometric-mean accuracy $\sqrt{\text{sensitivity} \times \text{specificity}}$; PR-AUC and ROC-AUC. Per-antibiotic results are averaged over seeds, then across antibiotics (each antibiotic weighs the same).
+- **Combined representations** use the phenotypes of the NDARO file; NDARO alone uses all NDARO assemblies, and combined representations use the assemblies shared by both sources.
+- **AMRFinderPlus baseline**: an isolate is called resistant when it carries at least one detected gene targeting the antibiotic's drug class (CARD ARO). It is evaluated on all isolates (Table 2) and on the isolates of each species (per-species and leave-one-species-out comparisons). Its summary averages the antibiotics that the rule can address (at least one gene maps to the drug class).
+- **Leave-one-species-out**: each of the four most represented species is held out in turn; the models are trained on the other species (90% training / 10% validation) and tested on all isolates of the held-out species, 5 seeds. A held-out antibiotic is kept when its test set has at least 5 isolates of the minority class.
+- **Integrated Gradients**: for the antibiotics where NDARO + BAKTA50 outperforms NDARO + BAKTA50 AMR, IG attributions (zero baseline, 50 steps) are computed for the UniRef50 clusters while each isolate's NDARO genes are held at their observed values. The attribution model follows the settings of the original analysis, documented at the top of the script.
 
-| Column | Description |
+## Outputs
+
+`main.py` writes to `output_dir`:
+
+| File | Content |
 |---|---|
-| `dataset` | Dataset name (e.g. `NDARO`, `BAKTA50`, `BAKTA50 + NDARO`) |
-| `antibiotic` | Antibiotic name (without the `a_` prefix) |
-| `n_samples` | Total samples with S or R label for this antibiotic |
-| `n_pos` | Number of resistant (R) samples |
-| `n_neg` | Number of susceptible (S) samples |
-| `runs` | Number of random seeds used |
-| `f1` | Mean F1 score across runs |
-| `accuracy` | Mean accuracy across runs |
-| `precision` | Mean precision across runs |
-| `recall` | Mean recall across runs |
-| `tp`, `tn`, `fp`, `fn` | Mean confusion matrix counts (rounded) |
-| `hidden_dims` | Model hidden layer sizes (JSON) |
-| `dropout` | Dropout rate used |
-| `learning_rate` | Learning rate used |
-| `batch_size` | Batch size used |
-| `epochs` | Maximum epochs configured |
+| `results_detailed.csv` | one row per (dataset, organism, antibiotic, seed): sample sizes, `f1`, `pr_auc`, `gmean`, `accuracy`, `precision`, `recall`, `specificity`, `roc_auc`, confusion-matrix counts, run time |
+| `results.csv` | per (dataset, organism, antibiotic): number of seeds, sample sizes, and `<metric>_mean` / `<metric>_std` across seeds |
 
-### Resume support
-
-The script checks the existing `results.csv` before starting each antibiotic. If a (dataset, antibiotic) pair is already present, it is skipped. This means user can safely **interrupt and restart** the script.
-
-### Detailed per-run results (`save_detailed_results`)
-
-When enabled, the script writes `<output_dir>/results_detailed.csv` alongside the aggregated `results.csv`. Each row records a **single run** instead of the averaged metrics:
-
-| Column | Description |
-|---|---|
-| `dataset` | Dataset name |
-| `antibiotic` | Antibiotic name |
-| `run` | Run index (0-based) |
-| `seed` | Random seed used for this run |
-| `n_samples`, `n_pos`, `n_neg` | Sample counts |
-| `f1`, `accuracy`, `precision`, `recall` | Metrics for this individual run (4 decimal places) |
-| `tp`, `tn`, `fp`, `fn` | Confusion matrix counts for this run |
-
-### Saved models (`save_models`)
-
-When enabled, the script saves the PyTorch `state_dict` of the **best model** (highest test F1 across all runs) for each (dataset, antibiotic) pair:
-
-```
-<output_dir>/models/<dataset_name>/<antibiotic_name>.pt
-```
-
-To reload a saved model:
+Runs can be interrupted and restarted: completed seeds are read from `results_detailed.csv` and skipped. With `save_models = True` the model of the first seed of every (dataset, antibiotic) is saved to `models/<dataset>/<antibiotic>_seed<seed>.pt`:
 
 ```python
 import torch
-from models import BaselineMLP  # or TwoTowerMLP for combined datasets
+from models import BaselineMLP, TwoTowerMLP
 
-model = BaselineMLP(input_dim=..., hidden_dims=[512, 256], dropout=0.2)
-model.load_state_dict(torch.load("results/models/NDARO/ciprofloxacin.pt"))
+model = BaselineMLP(input_dim=935, hidden_dims=[512, 256], dropout=0.2)   # NDARO
+model.load_state_dict(torch.load("results/random_split/models/NDARO/ciprofloxacin_seed0.pt"))
 model.eval()
 ```
 
-## Training details
+The outputs of the scripts in `scripts/` are described in [scripts/README.md](scripts/README.md).
 
-- **Class balancing**: per-sample weights inversely proportional to class frequency are applied during training to handle imbalanced S/R distributions.
-- **Loss function**: `BCEWithLogitsLoss` with per-sample weighting.
-- **Optimizer**: AdamW.
+## Project structure
+
+```
+├── main.py          # entry point: per-antibiotic training and evaluation (random or within-species)
+├── config.py        # ModelConfig and RunConfig dataclasses
+├── data.py          # loading NDARO and BAKTA files, alignment, antibiotic eligibility
+├── models.py        # BaselineMLP, TwoTowerMLP
+├── training.py      # splits, training loop with early stopping, metrics
+├── utils.py         # logging, device, results I/O and aggregation
+├── scripts/         # AMRFinderPlus baseline, leave-one-species-out, Integrated Gradients
+└── requirements.txt
+```
 
 ## Hardware
 

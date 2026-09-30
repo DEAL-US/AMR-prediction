@@ -1,5 +1,5 @@
 """
-Neural network architectures for the antibiotic resistance baseline.
+Neural network architectures for per-antibiotic resistance prediction.
 
 - BaselineMLP:   single-tower feed-forward network (for single feature source)
 - TowerMLP:      encoder branch used inside the two-tower model

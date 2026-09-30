@@ -1,304 +1,227 @@
 """
-Dataset loading, preparation, and feature/label extraction utilities.
+Dataset loading, alignment and antibiotic selection.
 
-Handles three dataset formats:
-  1. NDARO CSV  – standard CSV with ``g_*`` features and ``a_*`` antibiotic labels
-  2. Sparse BAKTA – triplet of ``.npz`` (scipy sparse matrix) + ``_assemblies.pkl``
-     + ``_columns.pkl``
-  3. Combined  – inner-join of NDARO + a sparse BAKTA dataset, aligned by assembly id
+Inputs (BioStudies S-BSST2698):
+  - ``ndaro_baseline.csv``: NDARO isolates. Columns ``assembly``, ``organism``, 935 ``g_*``
+    gene presence/absence features and 112 ``a_*`` phenotypes (``S``, ``R`` or empty).
+    An assembly can appear in several rows (one per NCBI release); the first row is kept.
+  - ``<name>.npz`` + ``<name>_columns.pkl`` + ``<name>_assemblies.pkl`` for
+    ``bakta50``, ``bakta50_amr``, ``bakta90`` and ``bakta90_amr``: sparse matrix whose
+    columns are UniRef cluster presence features plus ``a_*`` phenotype columns
+    (1 = R, 0 = S, NaN = not tested).
+
+Every source is converted to a :class:`Source` (sparse features + labels coded as
+-1 = missing, 0 = S, 1 = R). Combined representations are built by aligning sources on
+their shared assemblies; phenotype labels are taken from the first source (NDARO for
+the combined representations).
 """
+from __future__ import annotations
+
 import logging
 import pickle
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-import scipy.sparse
+import scipy.sparse as sp
 
-from config import DatasetConfig
+logger = logging.getLogger("amr")
 
-logger = logging.getLogger("baseline")
+# BioStudies file stem of each BAKTA representation.
+BAKTA_FILES: Dict[str, str] = {
+    "BAKTA50": "bakta50",
+    "BAKTA50 AMR": "bakta50_amr",
+    "BAKTA90": "bakta90",
+    "BAKTA90 AMR": "bakta90_amr",
+}
 
-
-# ---------------------------------------------------------------------------
-# Dataset config generation
-# ---------------------------------------------------------------------------
-def generate_dataset_configs(
-    ndaro_path: Path,
-    sparse_datasets: Dict[str, Path],
-) -> List[DatasetConfig]:
-    """
-    Build the list of :class:`DatasetConfig` objects to evaluate.
-
-    Returns (in order):
-      - NDARO baseline
-      - For each sparse dataset: the sparse dataset alone, then combined with NDARO
-    """
-    configs: List[DatasetConfig] = []
-
-    # 1. NDARO baseline
-    configs.append(DatasetConfig(
-        name="NDARO",
-        path=ndaro_path,
-        feature_prefix="g_",
-        antibiotic_prefix="a_",
-    ))
-
-    # 2. Each sparse dataset alone + combined with NDARO
-    for sparse_name, sparse_path in sparse_datasets.items():
-        configs.append(DatasetConfig(
-            name=sparse_name,
-            path=sparse_path,
-            feature_prefix="U_",
-            antibiotic_prefix="a_",
-        ))
-        configs.append(DatasetConfig(
-            name=f"{sparse_name} + NDARO",
-            path=Path("."),               
-            feature_prefix="g_|U_",       
-            antibiotic_prefix="a_",
-            is_combined=True,
-            sparse_component_name=sparse_name,
-        ))
-
-    return configs
+# The nine representations of Table 2 and the sources they are built from.
+# The first source provides the phenotype labels (and the organism, if present).
+DATASETS: Dict[str, List[str]] = {
+    "NDARO": ["NDARO"],
+    "NDARO + BAKTA50": ["NDARO", "BAKTA50"],
+    "NDARO + BAKTA50 AMR": ["NDARO", "BAKTA50 AMR"],
+    "NDARO + BAKTA90": ["NDARO", "BAKTA90"],
+    "NDARO + BAKTA90 AMR": ["NDARO", "BAKTA90 AMR"],
+    "BAKTA50 AMR": ["BAKTA50 AMR"],
+    "BAKTA90 AMR": ["BAKTA90 AMR"],
+    "BAKTA50": ["BAKTA50"],
+    "BAKTA90": ["BAKTA90"],
+}
 
 
-# ---------------------------------------------------------------------------
-# Core loader
-# ---------------------------------------------------------------------------
-def read_dataset(
-    cfg: DatasetConfig,
-    ndaro_path: Path,
-    sparse_datasets: Dict[str, Path],
-    allowed_assemblies: Optional[Set[str]] = None,
-) -> Optional[pd.DataFrame]:
-    """
-    Load a dataset described by *cfg*.
-
-    Parameters
-    ----------
-    cfg : DatasetConfig
-        Which dataset to load.
-    ndaro_path : Path
-        Path to the NDARO CSV (needed when building combined datasets).
-    sparse_datasets : dict
-        Mapping of sparse dataset names to their ``.npz`` base paths.
-    allowed_assemblies : set, optional
-        If given, only keep rows whose ``assembly`` column is in this set.
-    """
-
-    # --- Combined datasets (e.g. "BAKTA50 + NDARO") -------------------------
-    if cfg.is_combined and cfg.sparse_component_name:
-        return _load_combined(cfg, ndaro_path, sparse_datasets, allowed_assemblies)
-
-    # --- Sparse datasets (BAKTA variants) ------------------------------------
-    if _is_sparse_dataset(cfg.name, sparse_datasets):
-        return _load_sparse(cfg, allowed_assemblies)
-
-    # --- CSV datasets (NDARO) ------------------------------------------------
-    return _load_csv(cfg, allowed_assemblies)
+@dataclass
+class Source:
+    """One feature source (NDARO or a BAKTA representation)."""
+    features: sp.csr_matrix          # (n_assemblies, n_features), float32
+    feature_names: List[str]
+    assemblies: List[str]
+    labels: np.ndarray               # (n_assemblies, n_antibiotics), int8: -1 missing, 0 S, 1 R
+    label_names: List[str]           # "a_<antibiotic>"
+    organism: Optional[List[str]] = None
 
 
-# ---------------------------------------------------------------------------
-# Private loaders
-# ---------------------------------------------------------------------------
-def _is_sparse_dataset(name: str, sparse_datasets: Dict[str, Path]) -> bool:
-    return name in sparse_datasets or name.startswith("BAKTA")
+@dataclass
+class AlignedData:
+    """One or two feature blocks restricted to the assemblies shared by all sources."""
+    blocks: List[sp.csr_matrix]
+    assemblies: List[str]
+    labels: np.ndarray
+    label_names: List[str]
+    organism: Optional[np.ndarray] = None
 
-
-def _load_combined(
-    cfg: DatasetConfig,
-    ndaro_path: Path,
-    sparse_datasets: Dict[str, Path],
-    allowed_assemblies: Optional[Set[str]],
-) -> Optional[pd.DataFrame]:
-    sparse_name = cfg.sparse_component_name
-    if sparse_name not in sparse_datasets:
-        logger.warning(
-            "Sparse component '%s' not found in sparse_datasets; skipping %s",
-            sparse_name, cfg.name,
+    def subset(self, rows: np.ndarray) -> "AlignedData":
+        """Keep only the given rows (boolean mask or integer indices)."""
+        rows = np.flatnonzero(rows) if rows.dtype == bool else rows
+        return AlignedData(
+            blocks=[b[rows] for b in self.blocks],
+            assemblies=[self.assemblies[i] for i in rows],
+            labels=self.labels[rows],
+            label_names=self.label_names,
+            organism=None if self.organism is None else self.organism[rows],
         )
-        return None
-
-    logger.info("Building combined dataset '%s' from NDARO + %s", cfg.name, sparse_name)
-
-    ndaro_cfg = DatasetConfig(name="NDARO", path=ndaro_path, feature_prefix="g_")
-    sparse_cfg = DatasetConfig(
-        name=sparse_name, path=sparse_datasets[sparse_name], feature_prefix="U_",
-    )
-
-    ndaro_df = read_dataset(ndaro_cfg, ndaro_path, sparse_datasets, allowed_assemblies)
-    sparse_df = read_dataset(sparse_cfg, ndaro_path, sparse_datasets, allowed_assemblies)
-
-    if ndaro_df is None or sparse_df is None:
-        logger.warning("A component dataset could not be loaded; skipping combined dataset")
-        return None
-    if "assembly" not in ndaro_df.columns or "assembly" not in sparse_df.columns:
-        logger.warning("'assembly' column missing in a component; skipping combined dataset")
-        return None
-
-    # Align on the intersection of assemblies
-    ndaro_df = ndaro_df.drop_duplicates(subset=["assembly"]).set_index("assembly")
-    sparse_df = sparse_df.drop_duplicates(subset=["assembly"]).set_index("assembly")
-    common = ndaro_df.index.intersection(sparse_df.index)
-    if len(common) == 0:
-        logger.warning("No common assemblies between NDARO and %s", sparse_name)
-        return None
-    ndaro_df = ndaro_df.loc[common]
-    sparse_df = sparse_df.loc[common]
-
-    # Antibiotic columns: coalesce preferring sparse labels
-    ab_ndaro = [c for c in ndaro_df.columns if isinstance(c, str) and c.startswith("a_")]
-    ab_sparse = [c for c in sparse_df.columns if isinstance(c, str) and c.startswith("a_")]
-    ab_all = sorted(set(ab_ndaro) | set(ab_sparse))
-    ab_data = {}
-    for c in ab_all:
-        s_sp = sparse_df[c] if c in sparse_df.columns else pd.Series(index=common, dtype=object)
-        s_nd = ndaro_df[c] if c in ndaro_df.columns else pd.Series(index=common, dtype=object)
-        ab_data[c] = s_sp.combine_first(s_nd)
-    ab_df = pd.DataFrame(ab_data, index=common)
-
-    # Feature blocks
-    g_feats = [c for c in ndaro_df.columns if isinstance(c, str) and c.startswith("g_")]
-    u_feats = [c for c in sparse_df.columns if isinstance(c, str) and c.startswith("U_")]
-    g_block = ndaro_df[g_feats] if g_feats else pd.DataFrame(index=common)
-    u_block = sparse_df[u_feats] if u_feats else pd.DataFrame(index=common)
-
-    combined_df = pd.DataFrame({"assembly": common}, index=common)
-    combined_df = pd.concat([combined_df, ab_df, g_block, u_block], axis=1)
-    combined_df = combined_df.reset_index(drop=True)
-    logger.info(
-        "Combined dataset built: assemblies=%d, antibiotics=%d, "
-        "g_feats=%d, U_feats=%d, total_cols=%d",
-        len(common), len(ab_all), len(g_feats), len(u_feats), combined_df.shape[1],
-    )
-    return combined_df
 
 
-def _load_sparse(
-    cfg: DatasetConfig,
-    allowed_assemblies: Optional[Set[str]],
-) -> Optional[pd.DataFrame]:
-    base = cfg.path
-    base_root = base.with_suffix("") if base.suffix == ".npz" else base
-    npz_path = base if base.suffix == ".npz" else Path(str(base) + ".npz")
-    assemblies_path = Path(str(base_root) + "_assemblies.pkl")
-    columns_path = Path(str(base_root) + "_columns.pkl")
+# ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
+def load_ndaro_csv(csv_path: Path, chunksize: int = 100_000) -> Source:
+    """Read the NDARO CSV in chunks, keeping the first row of every assembly."""
+    header = pd.read_csv(csv_path, nrows=0).columns
+    g_cols = [c for c in header if c.startswith("g_")]
+    a_cols = [c for c in header if c.startswith("a_")]
+    keep = ["assembly", "organism"] + g_cols + a_cols
+    logger.info("Reading %s (%d genes, %d antibiotics)", csv_path, len(g_cols), len(a_cols))
 
-    if not (npz_path.exists() and assemblies_path.exists() and columns_path.exists()):
-        logger.warning(
-            "Sparse dataset files missing for %s: %s, %s, %s",
-            cfg.name, npz_path, assemblies_path, columns_path,
-        )
-        return None
+    seen: set = set()
+    parts = []
+    dtypes = {**{c: "Int8" for c in g_cols}, **{c: str for c in a_cols}}
+    for chunk in pd.read_csv(csv_path, usecols=keep, chunksize=chunksize, dtype=dtypes):
+        chunk = chunk[~chunk["assembly"].isin(seen)].drop_duplicates(subset=["assembly"])
+        seen.update(chunk["assembly"].tolist())
+        parts.append(chunk)
+    df = pd.concat(parts, ignore_index=True)
 
-    logger.info("Loading sparse dataset '%s' from base: %s", cfg.name, base_root)
-    mat = scipy.sparse.load_npz(str(npz_path))
-    with open(columns_path, "rb") as f:
+    features = sp.csr_matrix(df[g_cols].fillna(0).to_numpy(dtype=np.int8).astype(np.float32))
+    labels = np.full((len(df), len(a_cols)), -1, dtype=np.int8)
+    for j, c in enumerate(a_cols):
+        col = df[c].astype("string")
+        labels[(col == "S").fillna(False).to_numpy(dtype=bool), j] = 0
+        labels[(col == "R").fillna(False).to_numpy(dtype=bool), j] = 1
+    logger.info("NDARO: %d unique assemblies", len(df))
+    return Source(features=features, feature_names=g_cols, assemblies=df["assembly"].tolist(),
+                  labels=labels, label_names=a_cols, organism=df["organism"].tolist())
+
+
+def load_bakta(prefix: Path) -> Source:
+    """Read a BAKTA triplet ``<prefix>.npz``, ``<prefix>_columns.pkl``, ``<prefix>_assemblies.pkl``."""
+    mat = sp.load_npz(str(prefix) + ".npz")
+    with open(str(prefix) + "_columns.pkl", "rb") as f:
         columns = pickle.load(f)
-    with open(assemblies_path, "rb") as f:
+    with open(str(prefix) + "_assemblies.pkl", "rb") as f:
         assemblies = pickle.load(f)
+    ab_idx = [i for i, c in enumerate(columns) if str(c).startswith("a_")]
+    ab_set = set(ab_idx)
+    feat_idx = [i for i in range(len(columns)) if i not in ab_set]
 
-    # Separate antibiotic vs. feature columns
-    ab_idx = [i for i, c in enumerate(columns)
-              if isinstance(c, str) and c.startswith(cfg.antibiotic_prefix)]
-    feat_idx = [i for i, c in enumerate(columns) if i not in set(ab_idx)]
-    ab_cols = [columns[i] for i in ab_idx]
-    feat_cols_raw = [columns[i] for i in feat_idx]
-    feat_cols = [
-        c if isinstance(c, str) and c.startswith(cfg.feature_prefix)
-        else f"{cfg.feature_prefix}{c}"
-        for c in feat_cols_raw
-    ]
-
-    df = pd.DataFrame({"assembly": assemblies})
-
-    # Antibiotic block (small, dense) – remap numeric 0/1 to "S"/"R"
-    Y = mat[:, ab_idx].toarray().astype("float32")
-    ab_df = pd.DataFrame(Y, columns=ab_cols)
-    ab_df = ab_df.apply(lambda s: s.map({0: "S", 1: "R", 0.0: "S", 1.0: "R"}))
-    df = pd.concat([df, ab_df], axis=1)
-
-    # Feature block – keep sparse for memory efficiency
-    X_sparse = mat[:, feat_idx]
-    feat_df = pd.DataFrame.sparse.from_spmatrix(X_sparse, columns=feat_cols)
-    df = pd.concat([df, feat_df], axis=1)
-
-    if allowed_assemblies is not None and not df.empty:
-        df = df[df["assembly"].isin(allowed_assemblies)]
-
-    logger.info(
-        "Loaded sparse dataset shape: %s (features: %d, antibiotics: %d)",
-        df.shape, len(feat_cols), len(ab_cols),
-    )
-    return df
+    raw = mat[:, ab_idx].toarray()
+    labels = np.full(raw.shape, -1, dtype=np.int8)
+    labels[raw == 0] = 0
+    labels[raw == 1] = 1
+    logger.info("%s: %d assemblies, %d features", Path(prefix).name, len(assemblies), len(feat_idx))
+    return Source(features=mat[:, feat_idx].tocsr().astype(np.float32),
+                  feature_names=[str(columns[i]) for i in feat_idx],
+                  assemblies=list(assemblies),
+                  labels=labels, label_names=[str(columns[i]) for i in ab_idx])
 
 
-def _load_csv(
-    cfg: DatasetConfig,
-    allowed_assemblies: Optional[Set[str]],
-) -> Optional[pd.DataFrame]:
-    if not cfg.path.exists():
-        logger.warning("Dataset not found, skipping: %s -> %s", cfg.name, cfg.path)
-        return None
+class SourceCache:
+    """Loads every source at most once."""
 
-    logger.info("Loading dataset '%s' from %s", cfg.name, cfg.path)
-    df = pd.read_csv(cfg.path)
+    def __init__(self, ndaro_csv: Path, bakta_dir: Path):
+        self.ndaro_csv = Path(ndaro_csv)
+        self.bakta_dir = Path(bakta_dir)
+        self._cache: Dict[str, Source] = {}
 
-    if allowed_assemblies is not None and "assembly" in df.columns:
-        df = df[df["assembly"].isin(allowed_assemblies)]
-    logger.info("Loaded shape: %s", df.shape)
+    def get(self, name: str) -> Source:
+        if name not in self._cache:
+            if name == "NDARO":
+                self._cache[name] = load_ndaro_csv(self.ndaro_csv)
+            elif name in BAKTA_FILES:
+                self._cache[name] = load_bakta(self.bakta_dir / BAKTA_FILES[name])
+            else:
+                raise ValueError(f"Unknown source {name!r}")
+        return self._cache[name]
 
-    # NDARO deduplication
-    if cfg.name == "NDARO":
-        before = df.shape[0]
-        if "assembly" in df.columns:
-            df = df.drop_duplicates(subset=["assembly"]).reset_index(drop=True)
-        else:
-            df = df.drop_duplicates().reset_index(drop=True)
-        logger.info("Deduplicated '%s' rows: %d -> %d", cfg.name, before, df.shape[0])
-
-    return df
+    def organism_of(self) -> Dict[str, str]:
+        """assembly -> organism, from NDARO (BAKTA files carry no organism)."""
+        nd = self.get("NDARO")
+        return dict(zip(nd.assemblies, nd.organism))
 
 
 # ---------------------------------------------------------------------------
-# Feature / label helpers
+# Alignment and selection
 # ---------------------------------------------------------------------------
-def get_antibiotic_columns(df: pd.DataFrame, prefix: str = "a_") -> List[str]:
-    """Return column names that start with the antibiotic prefix."""
-    return [c for c in df.columns if c.startswith(prefix)]
+def align(sources: Sequence[Source]) -> AlignedData:
+    """Restrict every source to the (sorted) assemblies they share."""
+    common = sorted(set.intersection(*[{a for a in s.assemblies if isinstance(a, str) and a}
+                                       for s in sources]))
+    position = {a: i for i, a in enumerate(common)}
+    source_rows = []
+    for s in sources:
+        rows = np.zeros(len(common), dtype=np.int64)
+        for i, a in enumerate(s.assemblies):
+            if a in position:
+                rows[position[a]] = i
+        source_rows.append(rows)
+
+    organism = next((np.asarray([s.organism[i] for i in rows], dtype=object)
+                     for s, rows in zip(sources, source_rows) if s.organism is not None), None)
+    return AlignedData(blocks=[s.features[rows] for s, rows in zip(sources, source_rows)],
+                       assemblies=common,
+                       labels=sources[0].labels[source_rows[0]],
+                       label_names=sources[0].label_names,
+                       organism=organism)
 
 
-def get_feature_columns(df: pd.DataFrame, prefix: str) -> List[str]:
-    """Return column names that start with the given feature prefix."""
-    return [c for c in df.columns if c.startswith(prefix)]
+def load_dataset(name: str, cache: SourceCache, organism: Optional[str] = None) -> AlignedData:
+    """Build one of the representations in :data:`DATASETS`, optionally for a single organism."""
+    if name not in DATASETS:
+        raise ValueError(f"Unknown dataset {name!r}; choose from {list(DATASETS)}")
+    data = align([cache.get(s) for s in DATASETS[name]])
+    if organism is not None:
+        if data.organism is None:
+            lookup = cache.organism_of()
+            data.organism = np.asarray([lookup.get(a) for a in data.assemblies], dtype=object)
+        data = data.subset(data.organism == organism)
+        if not data.assemblies:
+            raise ValueError(f"No assemblies for organism {organism!r}")
+    return data
 
 
-def prepare_xy(
-    df: pd.DataFrame,
-    antibiotic_col: str,
-    feature_cols: List[str],
-    label_map: Dict[str, int],
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
-    """
-    Filter rows to those with labels in *label_map* and return
-    ``(X, y, counts_dict)``.
-    """
-    filtered = df[df[antibiotic_col].isin(label_map.keys())].copy()
-    if filtered.empty:
-        return (
-            np.empty((0, len(feature_cols))),
-            np.empty((0,), dtype=np.int64),
-            {"n_total": 0, "n_pos": 0, "n_neg": 0},
-        )
+def eligible_antibiotics(data: AlignedData, min_samples: int, min_minority: int,
+                         only: Optional[Sequence[str]] = None) -> List[str]:
+    """Antibiotics (``a_*`` names) with >= ``min_samples`` labelled isolates and
+    >= ``min_minority`` isolates in the minority class."""
+    names = data.label_names if only is None else [f"a_{a}" for a in only]
+    out = []
+    for name in names:
+        if name not in data.label_names:
+            logger.warning("Antibiotic %s not found; skipped", name)
+            continue
+        y = data.labels[:, data.label_names.index(name)]
+        n_pos, n_neg = int((y == 1).sum()), int((y == 0).sum())
+        if n_pos + n_neg >= min_samples and min(n_pos, n_neg) >= min_minority:
+            out.append(name)
+    return out
 
-    X = (filtered[feature_cols]
-         .apply(pd.to_numeric, errors="coerce")
-         .fillna(0.0)
-         .to_numpy(dtype=np.float32))
-    y = filtered[antibiotic_col].map(label_map).to_numpy(dtype=np.int64)
-    n_pos = int((y == 1).sum())
-    n_neg = int((y == 0).sum())
-    return X, y, {"n_total": len(y), "n_pos": n_pos, "n_neg": n_neg}
+
+def build_xy(data: AlignedData, antibiotic: str):
+    """Dense feature blocks, labels and organism of the isolates labelled for one antibiotic."""
+    y_raw = data.labels[:, data.label_names.index(antibiotic)]
+    mask = y_raw >= 0
+    blocks = [b[mask].toarray().astype(np.float32) for b in data.blocks]
+    organism = None if data.organism is None else data.organism[mask]
+    return blocks, y_raw[mask].astype(np.int64), organism

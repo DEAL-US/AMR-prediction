@@ -1,145 +1,80 @@
 """
-Utility helpers: metric aggregation, results I/O, model saving, logging setup,
-and device selection.
+Utility helpers: logging, device selection, per-seed results I/O (with resume),
+aggregation across seeds and model saving.
 """
+from __future__ import annotations
+
 import logging
-import math
 import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Set, Tuple
 
-import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
+
+from training import METRICS
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-def setup_logging(name: str = "baseline", level: int = logging.INFO) -> logging.Logger:
-    """Create and configure the project-wide logger."""
-    logger = logging.getLogger(name)
+class _TqdmHandler(logging.Handler):
+    """Writes log records above the progress bars instead of breaking them."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        tqdm.write(self.format(record))
+
+
+def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger("amr")
     if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        handler.setFormatter(formatter)
+        handler = _TqdmHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
         logger.addHandler(handler)
     logger.setLevel(level)
     return logger
 
 
-# ---------------------------------------------------------------------------
-# Metric aggregation
-# ---------------------------------------------------------------------------
-def aggregate_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
-    """Average classification metrics across multiple runs."""
-    metric_keys = ["f1", "accuracy", "precision", "recall"]
-    count_keys = ["tp", "tn", "fp", "fn"]
-    agg: Dict[str, float] = {}
-    for k in metric_keys:
-        vals = [m.get(k, math.nan) for m in metrics_list
-                if not math.isnan(m.get(k, math.nan))]
-        agg[k] = float(np.mean(vals)) if vals else math.nan
-    for k in count_keys:
-        vals = [m.get(k, 0) for m in metrics_list]
-        agg[k] = int(round(float(np.mean(vals)))) if vals else 0
-    return agg
+def get_device(preference: str = "auto") -> torch.device:
+    """``"auto"`` uses CUDA when available, otherwise the CPU."""
+    if preference == "auto":
+        preference = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(preference)
 
 
 # ---------------------------------------------------------------------------
-# Results persistence (with resume support)
+# Per-seed results
 # ---------------------------------------------------------------------------
-def ensure_results_dir(output_dir: Path) -> Path:
-    """Create the output directory (if needed) and return the results CSV path."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / "results.csv"
+def completed_runs(detailed_csv: Path, key_cols: List[str]) -> Set[Tuple]:
+    """Keys of the runs already present in ``detailed_csv`` (used to resume)."""
+    if not detailed_csv.exists():
+        return set()
+    done = pd.read_csv(detailed_csv, usecols=key_cols, dtype=str, keep_default_na=False)
+    return set(map(tuple, done[key_cols].itertuples(index=False, name=None)))
 
 
-def load_existing_results(csv_path: Path) -> pd.DataFrame:
-    """Load previously saved results or return an empty DataFrame."""
-    if csv_path.exists():
-        try:
-            return pd.read_csv(csv_path)
-        except Exception:
-            pass
-    return pd.DataFrame()
+def append_row(detailed_csv: Path, row: Dict[str, object]) -> None:
+    """Append one run to ``detailed_csv`` (written after every run, so a crash loses nothing)."""
+    pd.DataFrame([row]).to_csv(detailed_csv, mode="a", index=False,
+                               header=not detailed_csv.exists())
 
 
-def result_row_exists(df: pd.DataFrame, dataset_name: str, antibiotic: str) -> bool:
-    """Check whether a (dataset, antibiotic) pair has already been computed."""
-    if df.empty:
-        return False
-    mask = (df["dataset"] == dataset_name) & (df["antibiotic"] == antibiotic)
-    return bool(mask.any())
+def aggregate(detailed_csv: Path, out_csv: Path, group_cols: Iterable[str]) -> pd.DataFrame:
+    """Mean and standard deviation across seeds of every metric."""
+    d = pd.read_csv(detailed_csv, keep_default_na=False, na_values=[""])
+    group_cols = list(group_cols)
+    agg = {"n_seeds": ("seed", "nunique"), "n_total": ("n_total", "first"),
+           "n_pos_total": ("n_pos_total", "first")}
+    for m in METRICS:
+        agg[f"{m}_mean"] = (m, "mean")
+        agg[f"{m}_std"] = (m, "std")
+    out = d.groupby(group_cols, sort=False).agg(**agg).reset_index()
+    out.to_csv(out_csv, index=False)
+    return out
 
 
-def write_results(
-    csv_path: Path,
-    existing_df: pd.DataFrame,
-    new_rows: List[Dict[str, object]],
-) -> pd.DataFrame:
-    """Append *new_rows* to *existing_df*, deduplicate, and persist to CSV."""
-    if not new_rows:
-        return existing_df
-    new_df = pd.DataFrame(new_rows)
-    combined = pd.concat([existing_df, new_df], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["dataset", "antibiotic"], keep="first")
-    combined.to_csv(csv_path, index=False)
-    logger = logging.getLogger("baseline")
-    logger.info("Wrote results to %s (rows=%d)", csv_path, len(combined))
-    return combined
-
-
-# ---------------------------------------------------------------------------
-# Detailed (per-run) results persistence
-# ---------------------------------------------------------------------------
-def write_detailed_results(
-    csv_path: Path,
-    new_rows: List[Dict[str, object]],
-) -> None:
-    """Append per-run metric rows to the detailed results CSV."""
-    if not new_rows:
-        return
-    new_df = pd.DataFrame(new_rows)
-    if csv_path.exists():
-        new_df.to_csv(csv_path, mode="a", header=False, index=False)
-    else:
-        new_df.to_csv(csv_path, index=False)
-    logger = logging.getLogger("baseline")
-    logger.info("Appended %d rows to %s", len(new_rows), csv_path)
-
-
-# ---------------------------------------------------------------------------
-# Model saving
-# ---------------------------------------------------------------------------
-def _sanitize_name(name: str) -> str:
-    """Make a string safe for use as a file/directory name."""
-    return re.sub(r'[^\w\-]', '_', name).strip('_')
-
-
-def save_model_state(
-    output_dir: Path,
-    dataset_name: str,
-    antibiotic_name: str,
-    state_dict: dict,
-) -> Path:
-    """Save a model's ``state_dict`` to ``<output_dir>/models/<dataset>/<antibiotic>.pt``."""
-    model_dir = output_dir / "models" / _sanitize_name(dataset_name)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    path = model_dir / f"{_sanitize_name(antibiotic_name)}.pt"
-    torch.save(state_dict, path)
-    logger = logging.getLogger("baseline")
-    logger.info("Saved model to %s", path)
+def save_model_state(output_dir: Path, dataset: str, antibiotic: str, seed: int, state: dict) -> Path:
+    """Save a ``state_dict`` to ``<output_dir>/models/<dataset>/<antibiotic>_seed<seed>.pt``."""
+    clean = lambda s: re.sub(r"[^\w\-]+", "_", s).strip("_")
+    path = output_dir / "models" / clean(dataset) / f"{clean(antibiotic)}_seed{seed}.pt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, path)
     return path
-
-
-# ---------------------------------------------------------------------------
-# Device helper
-# ---------------------------------------------------------------------------
-def get_device() -> torch.device:
-    logger = logging.getLogger("baseline")
-    if torch.cuda.is_available():
-        logger.info("Using CUDA")
-        return torch.device("cuda")
-    logger.info("Using CPU")
-    return torch.device("cpu")

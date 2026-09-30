@@ -1,346 +1,141 @@
 """
-Antibiotic Resistance Prediction – Baseline MLP Experiments
-===========================================================
+Antimicrobial resistance prediction: one binary model per antibiotic
+=====================================================================
 
-Entry-point script.  Edit the ``config`` dictionary below to configure
-dataset paths, hyperparameters, and which antibiotics to evaluate.
+Trains and evaluates every feature representation of Table 2 with the protocol of the
+paper (30 seeds, stratified 72/8/20 split, early stopping on validation F1). Setting
+``organism`` restricts training and evaluation to one species (per-species analysis).
 
-Run with::
+Edit ``CONFIG`` below, or override its main entries from the command line, e.g.::
 
     python main.py
-"""
-import json
-import math
-from pathlib import Path
-from typing import Dict, List, Optional
+    python main.py --organism "Campylobacter jejuni" --output-dir results/campylobacter_jejuni
+    python main.py --datasets NDARO "NDARO + BAKTA50" --antibiotics ciprofloxacin --n-seeds 2
 
-import numpy as np
-import pandas as pd
-import torch
+Outputs (in ``output_dir``):
+    results_detailed.csv   one row per (dataset, antibiotic, seed)
+    results.csv            mean and std across seeds per (dataset, antibiotic)
+Interrupted runs resume where they stopped (completed seeds are skipped).
+"""
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
 from tqdm import tqdm
 
-from config import ModelConfig, RunConfig, DatasetConfig
-from data import (
-    generate_dataset_configs,
-    read_dataset,
-    get_antibiotic_columns,
-    get_feature_columns,
-    prepare_xy,
-)
-from training import (
-    train_and_eval_once,
-    train_and_eval_once_two_tower,
-)
-from utils import (
-    setup_logging,
-    aggregate_metrics,
-    ensure_results_dir,
-    load_existing_results,
-    result_row_exists,
-    write_results,
-    write_detailed_results,
-    save_model_state,
-    get_device,
-)
+from config import ModelConfig, RunConfig
+from data import DATASETS, SourceCache, build_xy, eligible_antibiotics, load_dataset
+from training import METRICS, set_seed, split_random, train_one
+from utils import aggregate, append_row, completed_runs, get_device, save_model_state, setup_logging
+
+# ===========================================================================
+#  CONFIGURATION - edit the values below to match your setup
+# ===========================================================================
+CONFIG = {
+    # -- Data (BioStudies S-BSST2698) ---------------------------------------
+    "ndaro_csv": "data/ndaro_baseline.csv",
+    "bakta_dir": "data",                 # bakta50.npz, bakta50_amr.npz, bakta90.npz, bakta90_amr.npz
+                                         # (+ their _columns.pkl / _assemblies.pkl)
+    "output_dir": "results/random_split",
+
+    # -- Experiment ---------------------------------------------------------
+    "datasets": list(DATASETS),          # the nine representations of Table 2
+    "organism": None,                    # e.g. "Campylobacter jejuni" for within-species training
+    "antibiotics": None,                 # None = every eligible antibiotic, or a list of names
+    "n_seeds": 30,
+    "seed_offset": 0,                    # seeds 0..29
+    "min_samples": 50,                   # eligibility: >= 50 labelled isolates
+    "min_minority": 5,                   #              and >= 5 in the minority class
+
+    # -- Model and training -------------------------------------------------
+    "hidden_dims": [512, 256],
+    "dropout": 0.2,
+    "learning_rate": 1e-3,
+    "weight_decay": 0.0,
+    "batch_size": 512,
+    "max_epochs": 200,
+    "patience": 10,
+    "device": "auto",                    # "auto", "cuda" or "cpu"
+
+    # -- Optional output ----------------------------------------------------
+    "save_models": False,                # save the first seed's model of every (dataset, antibiotic)
+}
+# ===========================================================================
+
+KEY = ["dataset", "organism", "antibiotic", "seed"]
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-def run_for_dataset(
-    dcfg: DatasetConfig,
-    mcfg: ModelConfig,
-    rcfg: RunConfig,
-    existing_results: pd.DataFrame,
-    device: torch.device,
-    ndaro_path: Path,
-    sparse_datasets: Dict[str, Path],
-    limit_antibiotics: Optional[List[str]] = None,
-    results_csv: Optional[Path] = None,
-    save_models: bool = False,
-    save_detailed_results: bool = False,
-    output_dir: Optional[Path] = None,
-) -> List[Dict[str, object]]:
-    """
-    Run all antibiotic experiments for a single dataset configuration.
+def parse_overrides(cfg: dict) -> dict:
+    p = argparse.ArgumentParser(description="Per-antibiotic AMR prediction (overrides CONFIG).")
+    p.add_argument("--ndaro-csv")
+    p.add_argument("--bakta-dir")
+    p.add_argument("--output-dir")
+    p.add_argument("--datasets", nargs="+", choices=list(DATASETS))
+    p.add_argument("--organism")
+    p.add_argument("--antibiotics", nargs="+")
+    p.add_argument("--n-seeds", type=int)
+    p.add_argument("--seed-offset", type=int)
+    p.add_argument("--device")
+    args = vars(p.parse_args())
+    return {**cfg, **{k: v for k, v in args.items() if v is not None}}
 
-    For every antibiotic column found in the loaded data (optionally filtered
-    by *limit_antibiotics*), trains ``rcfg.runs_per_antibiotic`` models with
-    different random seeds and records the aggregated metrics.
-    """
+
+def main(cfg: dict) -> None:
     logger = setup_logging()
+    mcfg = ModelConfig(hidden_dims=cfg["hidden_dims"], dropout=cfg["dropout"],
+                       learning_rate=cfg["learning_rate"], weight_decay=cfg["weight_decay"],
+                       batch_size=cfg["batch_size"], max_epochs=cfg["max_epochs"],
+                       patience=cfg["patience"])
+    rcfg = RunConfig(n_seeds=cfg["n_seeds"], seed_offset=cfg["seed_offset"],
+                     min_samples=cfg["min_samples"], min_minority=cfg["min_minority"])
+    device = get_device(cfg["device"])
+    out_dir = Path(cfg["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    detailed_csv = out_dir / "results_detailed.csv"
+    done = completed_runs(detailed_csv, KEY)
+    organism_label = cfg["organism"] or "all"
+    logger.info("Device: %s | organism: %s | output: %s", device, organism_label, out_dir)
 
-    df = read_dataset(dcfg, ndaro_path, sparse_datasets)
-    if df is None:
-        return []
+    cache = SourceCache(cfg["ndaro_csv"], cfg["bakta_dir"])
+    seeds = range(rcfg.seed_offset, rcfg.seed_offset + rcfg.n_seeds)
+    for dataset in tqdm(cfg["datasets"], desc="datasets"):
+        data = load_dataset(dataset, cache, cfg["organism"])
+        antibiotics = eligible_antibiotics(data, rcfg.min_samples, rcfg.min_minority, cfg["antibiotics"])
+        logger.info("=== %s | %d assemblies | %d features | %d eligible antibiotics ===",
+                    dataset, len(data.assemblies), sum(b.shape[1] for b in data.blocks), len(antibiotics))
 
-    # Determine feature columns ------------------------------------------
-    if dcfg.is_combined:
-        g_cols = [c for c in df.columns if c.startswith("g_")]
-        u_cols = [c for c in df.columns if c.startswith("U_")]
-        if not g_cols or not u_cols:
-            logger.warning("Combined dataset missing features (g_=%d, U_=%d); skipping",
-                           len(g_cols), len(u_cols))
-            return []
-    else:
-        feature_cols = get_feature_columns(df, dcfg.feature_prefix)
-        if not feature_cols:
-            logger.warning("No feature columns with prefix '%s' in %s; skipping",
-                           dcfg.feature_prefix, dcfg.name)
-            return []
-
-    # Determine antibiotic columns ----------------------------------------
-    antibiotic_cols = get_antibiotic_columns(df, dcfg.antibiotic_prefix)
-    if not antibiotic_cols:
-        logger.warning("No antibiotic columns in %s; skipping", dcfg.name)
-        return []
-
-    if limit_antibiotics is not None:
-        antibiotic_cols = [
-            c for c in antibiotic_cols
-            if c[len(dcfg.antibiotic_prefix):] in limit_antibiotics
-        ]
-        if not antibiotic_cols:
-            logger.warning("No matching antibiotics in %s for the specified filter", dcfg.name)
-            return []
-        logger.info("Filtered to %d antibiotics", len(antibiotic_cols))
-
-    # Per-antibiotic loop -------------------------------------------------
-    results: List[Dict[str, object]] = []
-    pbar = tqdm(antibiotic_cols, desc=f"{dcfg.name} antibiotics")
-    for a_col in pbar:
-        antibiotic_name = a_col[len(dcfg.antibiotic_prefix):]
-        pbar.set_postfix({"ab": antibiotic_name[:20]})
-
-        # Resume support
-        if result_row_exists(existing_results, dcfg.name, antibiotic_name):
-            logger.info("Skipping already computed: %s / %s", dcfg.name, antibiotic_name)
-            continue
-
-        # Build feature matrices & labels ---------------------------------
-        if dcfg.is_combined:
-            valid = df[a_col].isin(rcfg.label_map.keys())
-            filtered = df[valid].copy()
-            if filtered.empty:
-                continue
-            Xg = filtered[g_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-            Xu = filtered[u_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-            y = filtered[a_col].map(rcfg.label_map).to_numpy(dtype=np.int64)
-            n_pos, n_neg, n_total = int((y == 1).sum()), int((y == 0).sum()), len(y)
-        else:
-            X, y, counts = prepare_xy(df, a_col, feature_cols, rcfg.label_map)
-            n_total, n_pos, n_neg = counts["n_total"], counts["n_pos"], counts["n_neg"]
-
-        if n_total == 0 or n_pos == 0 or n_neg == 0:
-            logger.info("Skipping %s / %s: insufficient labels (total=%d, pos=%d, neg=%d)",
-                        dcfg.name, antibiotic_name, n_total, n_pos, n_neg)
-            continue
-
-        # Multiple random runs -------------------------------------------
-        metrics_runs: List[Dict[str, float]] = []
-        best_f1 = float("-inf")
-        best_state_dict = None
-        best_seed = None
-        detailed_rows: List[Dict[str, object]] = []
-
-        for run_idx in tqdm(range(rcfg.runs_per_antibiotic),
-                            desc=f"runs {antibiotic_name}", leave=False):
-            seed = rcfg.base_seed + run_idx
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            if dcfg.is_combined:
-                metrics, state = train_and_eval_once_two_tower(Xg, Xu, y, mcfg, seed, device)
-            else:
-                metrics, state = train_and_eval_once(X, y, mcfg, seed, device)
-            metrics_runs.append(metrics)
-
-            # Track best model (by F1)
-            run_f1 = metrics.get("f1", float("nan"))
-            if not math.isnan(run_f1) and run_f1 > best_f1:
-                best_f1 = run_f1
-                best_state_dict = state
-                best_seed = seed
-
-            # Collect per-run row for detailed CSV
-            if save_detailed_results:
-                detailed_rows.append({
-                    "dataset": dcfg.name,
-                    "antibiotic": antibiotic_name,
-                    "run": run_idx,
-                    "seed": seed,
-                    "n_samples": n_total,
-                    "n_pos": n_pos,
-                    "n_neg": n_neg,
-                    "f1": None if math.isnan(metrics.get("f1", math.nan)) else round(metrics["f1"], 4),
-                    "accuracy": None if math.isnan(metrics.get("accuracy", math.nan)) else round(metrics["accuracy"], 4),
-                    "precision": None if math.isnan(metrics.get("precision", math.nan)) else round(metrics["precision"], 4),
-                    "recall": None if math.isnan(metrics.get("recall", math.nan)) else round(metrics["recall"], 4),
-                    "tp": metrics.get("tp", 0),
-                    "tn": metrics.get("tn", 0),
-                    "fp": metrics.get("fp", 0),
-                    "fn": metrics.get("fn", 0),
+        for a_col in tqdm(antibiotics, desc=dataset, leave=False):
+            antibiotic = a_col[2:]
+            X_blocks, y, _ = build_xy(data, a_col)
+            seed_bar = tqdm(seeds, desc=antibiotic[:25], leave=False)
+            for seed in seed_bar:
+                if (dataset, organism_label, antibiotic, str(seed)) in done:
+                    continue
+                t0 = time.time()
+                set_seed(seed)
+                split = split_random(y, rcfg.test_size, rcfg.val_fraction, seed)
+                save = cfg["save_models"] and seed == rcfg.seed_offset
+                m, state = train_one(X_blocks, y, split, mcfg, device, rcfg.threshold, return_state=save)
+                if save:
+                    save_model_state(out_dir, dataset, antibiotic, seed, state)
+                append_row(detailed_csv, {
+                    "dataset": dataset, "organism": organism_label, "antibiotic": antibiotic, "seed": seed,
+                    "n_total": len(y), "n_pos_total": int(y.sum()),
+                    "n_train": len(split[0]), "n_val": len(split[1]), "n_test": m["n_test"],
+                    "n_pos_test": m["n_pos_test"],
+                    **{k: m[k] for k in METRICS + ["tp", "tn", "fp", "fn"]},
+                    "time_s": round(time.time() - t0, 2),
                 })
+                seed_bar.set_postfix(seed=seed, f1=f"{m['f1']:.3f}", gmean=f"{m['gmean']:.3f}")
+                logger.debug("[%s | %s | seed %d] F1 %.3f  G-mean %.3f  PR-AUC %.3f (%.1fs)",
+                             dataset, antibiotic, seed, m["f1"], m["gmean"], m["pr_auc"], time.time() - t0)
 
-        # Save best model weights
-        if save_models and best_state_dict is not None and output_dir is not None:
-            save_model_state(output_dir, dcfg.name, antibiotic_name, best_state_dict)
-
-        # Write detailed per-run results
-        if save_detailed_results and detailed_rows and output_dir is not None:
-            detailed_csv = output_dir / "results_detailed.csv"
-            write_detailed_results(detailed_csv, detailed_rows)
-
-        agg = aggregate_metrics(metrics_runs)
-        row = {
-            "dataset": dcfg.name,
-            "antibiotic": antibiotic_name,
-            "n_samples": n_total,
-            "n_pos": n_pos,
-            "n_neg": n_neg,
-            "runs": rcfg.runs_per_antibiotic,
-            "f1": None if math.isnan(agg["f1"]) else round(agg["f1"], 2),
-            "accuracy": None if math.isnan(agg["accuracy"]) else round(agg["accuracy"], 2),
-            "precision": None if math.isnan(agg["precision"]) else round(agg["precision"], 2),
-            "recall": None if math.isnan(agg["recall"]) else round(agg["recall"], 2),
-            "tp": agg.get("tp", 0),
-            "tn": agg.get("tn", 0),
-            "fp": agg.get("fp", 0),
-            "fn": agg.get("fn", 0),
-            "hidden_dims": json.dumps(mcfg.hidden_dims),
-            "dropout": mcfg.dropout,
-            "learning_rate": mcfg.learning_rate,
-            "batch_size": mcfg.batch_size,
-            "epochs": mcfg.epochs,
-        }
-        results.append(row)
-
-        # Persist incrementally for crash resilience
-        if results_csv is not None:
-            existing_results = write_results(results_csv, existing_results, [row])
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    # ===================================================================
-    #  CONFIGURATION – edit the values below to match your setup
-    # ===================================================================
-    config = {
-        # -- Dataset paths ------------------------------------------------
-        # NDARO baseline CSV (columns: assembly, organism, g_* features, a_* labels)
-        "ndaro_path": "ndaro_baseline.csv",
-
-        # Sparse BAKTA datasets – each needs a triplet of files:
-        #   <path>.npz, <path>_assemblies.pkl, <path>_columns.pkl
-        "sparse_datasets": {
-            "BAKTA50":     "bakta50.npz",
-            "BAKTA50 AMR": "bakta50_amr.npz",
-            "BAKTA90":     "bakta90.npz",
-            "BAKTA90 AMR": "bakta90_amr.npz",
-        },
-
-        # -- Output -------------------------------------------------------
-        "output_dir": "results",        # directory where results.csv will be written
-
-        # -- Model hyperparameters ----------------------------------------
-        "hidden_dims": [512, 256],
-        "dropout": 0.2,
-        "lr": 1e-3,
-        "weight_decay": 0.0,
-        "batch_size": 512,
-        "epochs": 200,
-
-        # -- Early stopping -----------------------------------------------
-        "val_fraction": 0.1,
-        "use_early_stopping": True,
-        "es_metric": "f1",              # one of: f1, accuracy, precision, recall
-        "es_patience": 10,
-        "es_min_delta": 0.0,
-
-        # -- Experiment protocol ------------------------------------------
-        "runs": 30,                     # independent seeds per antibiotic
-
-        # -- Optional outputs ---------------------------------------------
-        "save_models": True,           # save best model state_dict per (dataset, antibiotic)
-        "save_detailed_results": True, # save per-run metrics to results_detailed.csv
-
-        # -- Antibiotic filter (None = evaluate all) ----------------------
-        "limit_antibiotics": None,
-        # Example: uncomment the list below to restrict to specific antibiotics
-        # "limit_antibiotics": [
-        #     "amoxicillin-clavulanic acid", "piperacillin",
-        #     "piperacillin-tazobactam", "cefotaxime", "cefepime",
-        #     "gentamicin", "tobramycin", "amikacin",
-        #     "trimethoprim-sulfamethoxazole", "fosfomycin",
-        #     "ciprofloxacin", "ertapenem", "meropenem",
-        # ],
-    }
-
-    # ===================================================================
-    logger = setup_logging()
-    logger.info("Config: %s", json.dumps(config, default=str))
-
-    # Build typed configs
-    ndaro_path = Path(config["ndaro_path"])
-    sparse_datasets: Dict[str, Path] = {
-        k: Path(v) for k, v in config["sparse_datasets"].items()
-    }
-    output_dir = Path(config["output_dir"])
-
-    mcfg = ModelConfig(
-        hidden_dims=config["hidden_dims"],
-        dropout=config["dropout"],
-        learning_rate=config["lr"],
-        weight_decay=config["weight_decay"],
-        batch_size=config["batch_size"],
-        epochs=config["epochs"],
-        val_fraction=config["val_fraction"],
-        use_early_stopping=config["use_early_stopping"],
-        es_metric=config["es_metric"],
-        es_patience=config["es_patience"],
-        es_min_delta=config["es_min_delta"],
-    )
-    rcfg = RunConfig(runs_per_antibiotic=config["runs"])
-
-    device = get_device()
-
-    # Results CSV (with resume support)
-    results_csv = ensure_results_dir(output_dir)
-    existing_df = load_existing_results(results_csv)
-
-    # Generate the list of dataset configurations
-    dataset_configs = generate_dataset_configs(ndaro_path, sparse_datasets)
-
-    logger.info("Datasets to evaluate: %s",
-                ", ".join(dc.name for dc in dataset_configs))
-
-    # Main loop – one pass per dataset config
-    for dcfg in dataset_configs:
-        logger.info("=" * 60)
-        logger.info("Processing dataset: %s", dcfg.name)
-        logger.info("=" * 60)
-        run_for_dataset(
-            dcfg=dcfg,
-            mcfg=mcfg,
-            rcfg=rcfg,
-            existing_results=existing_df,
-            device=device,
-            ndaro_path=ndaro_path,
-            sparse_datasets=sparse_datasets,
-            limit_antibiotics=config["limit_antibiotics"],
-            results_csv=results_csv,
-            save_models=config["save_models"],
-            save_detailed_results=config["save_detailed_results"],
-            output_dir=output_dir,
-        )
-        # Refresh from disk after each dataset (picks up newly written rows)
-        existing_df = load_existing_results(results_csv)
-
-    logger.info("All datasets processed! Results saved to %s", results_csv)
+    if detailed_csv.exists():
+        aggregate(detailed_csv, out_dir / "results.csv", ["dataset", "organism", "antibiotic"])
+        logger.info("Done. Per-seed: %s | aggregated: %s", detailed_csv, out_dir / "results.csv")
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_overrides(CONFIG))

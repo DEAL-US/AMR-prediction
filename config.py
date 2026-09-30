@@ -1,51 +1,31 @@
 """
-Configuration dataclasses and default constants for the baseline experiments.
+Configuration dataclasses shared by the training entry points
+(``main.py`` and ``scripts/loso_evaluation.py``).
 """
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import List
 
 
 @dataclass
 class ModelConfig:
-    """Hyperparameters for the MLP models."""
-    hidden_dims: List[int] = None       # e.g., [512, 256]
+    """Network architecture and optimisation hyperparameters."""
+    hidden_dims: List[int] = field(default_factory=lambda: [512, 256])
     dropout: float = 0.2
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     batch_size: int = 512
-    epochs: int = 30
-    # Validation / Early stopping
-    val_fraction: float = 0.1
-    use_early_stopping: bool = True
-    es_metric: str = "f1"               # one of: f1, accuracy, precision, recall
-    es_patience: int = 10
-    es_min_delta: float = 0.0
-
-    def __post_init__(self):
-        if self.hidden_dims is None:
-            self.hidden_dims = [512, 256]
+    max_epochs: int = 200
+    patience: int = 10              # early stopping on validation F1
+    min_delta: float = 1e-6         # minimum validation-F1 improvement that resets patience
 
 
 @dataclass
 class RunConfig:
-    """Controls the experimental protocol (seeds, splits, label mapping)."""
-    test_size: float = 0.2
-    runs_per_antibiotic: int = 30
-    base_seed: int = 1337
-    label_map: Dict[str, int] = None    # mapping of antibiotic phenotype labels to 0/1
-
-    def __post_init__(self):
-        if self.label_map is None:
-            self.label_map = {"S": 0, "R": 1}
-
-
-@dataclass
-class DatasetConfig:
-    """Describes a single dataset (or a combined dataset) to evaluate."""
-    name: str
-    path: Path
-    feature_prefix: str
-    antibiotic_prefix: str = "a_"
-    is_combined: bool = False                       # True when this is a combined dataset (NDARO + sparse)
-    sparse_component_name: Optional[str] = None     # Key into sparse_datasets dict for combined datasets
+    """Experimental protocol: splits, seeds, antibiotic eligibility and decision threshold."""
+    n_seeds: int = 30               # independent seeds per (dataset, antibiotic)
+    seed_offset: int = 0            # seeds used: seed_offset, ..., seed_offset + n_seeds - 1
+    test_size: float = 0.2          # 20% test
+    val_fraction: float = 0.1       # 10% of the remaining 80% -> 72 / 8 / 20 split
+    min_samples: int = 50           # antibiotics need >= 50 labelled isolates ...
+    min_minority: int = 5           # ... and >= 5 isolates in the minority class
+    threshold: float = 0.5          # decision threshold on the predicted probability
