@@ -88,7 +88,8 @@ class AlignedData:
 # Loaders
 # ---------------------------------------------------------------------------
 def load_ndaro_csv(csv_path: Path, chunksize: int = 100_000) -> Source:
-    """Read the NDARO CSV in chunks, keeping the first row of every assembly."""
+    """Read the NDARO CSV in chunks, keeping the first row of every assembly
+    (rows without an assembly identifier are dropped)."""
     header = pd.read_csv(csv_path, nrows=0).columns
     g_cols = [c for c in header if c.startswith("g_")]
     a_cols = [c for c in header if c.startswith("a_")]
@@ -99,7 +100,8 @@ def load_ndaro_csv(csv_path: Path, chunksize: int = 100_000) -> Source:
     parts = []
     dtypes = {**{c: "Int8" for c in g_cols}, **{c: str for c in a_cols}}
     for chunk in pd.read_csv(csv_path, usecols=keep, chunksize=chunksize, dtype=dtypes):
-        chunk = chunk[~chunk["assembly"].isin(seen)].drop_duplicates(subset=["assembly"])
+        chunk = chunk[chunk["assembly"].notna() & ~chunk["assembly"].isin(seen)]
+        chunk = chunk.drop_duplicates(subset=["assembly"])
         seen.update(chunk["assembly"].tolist())
         parts.append(chunk)
     df = pd.concat(parts, ignore_index=True)

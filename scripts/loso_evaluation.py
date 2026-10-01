@@ -192,10 +192,15 @@ def main(cfg: dict) -> None:
     cache = SourceCache(cfg["ndaro_csv"], cfg["bakta_dir"])
     seeds = range(rcfg.seed_offset, rcfg.seed_offset + rcfg.n_seeds)
     for dataset in tqdm(cfg["datasets"], desc="datasets"):
+        if cfg["antibiotics"] and all((dataset, h, a, str(s)) in done for h in cfg["holdout_species"]
+                                      for a in cfg["antibiotics"] for s in seeds):
+            logger.info("%s: all requested runs already done; skipped", dataset)
+            continue
         data = load_dataset(dataset, cache)
+        eligible = eligible_antibiotics(data, rcfg.min_samples, rcfg.min_minority)
         antibiotics = eligible_antibiotics(data, rcfg.min_samples, rcfg.min_minority, cfg["antibiotics"])
-        logger.info("=== %s | %d assemblies | %d eligible antibiotics ===",
-                    dataset, len(data.assemblies), len(antibiotics))
+        logger.info("=== %s | %d assemblies | %d eligible antibiotics, %d selected ===",
+                    dataset, len(data.assemblies), len(eligible), len(antibiotics))
         for held_out in tqdm(cfg["holdout_species"], desc="held-out species", leave=False):
             for a_col in tqdm(antibiotics, desc=held_out[:25], leave=False):
                 antibiotic = a_col[2:]
